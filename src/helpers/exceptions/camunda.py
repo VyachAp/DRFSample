@@ -1,0 +1,2 @@
+class NoTask(Exception):
+    pass
