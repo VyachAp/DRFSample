@@ -44,9 +44,7 @@ class CardGenerationService:
         return datetime.strptime(str_dttm, "%Y-%m-%dT%H:%M:%S%z").date()
 
     def _recalculate_hire_dt(self, historical_records: List[Dict]):
-        # При переустройстве технически hire_dt - есть дата последнего прием на работу,
-        # но по смыслу если человек переустроен в течение 2-х недель,
-        # то hire_dt необходимо заменить на hire_dt с предыдущей записи о работе
+        # need to pass through all record actual hire_dt if employee turned back/re-hired in 2 weeks
         prev_record = None
         for record in historical_records:
             if (
@@ -93,7 +91,7 @@ class CardGenerationService:
                 ).first()
 
                 if existing_card and existing_card.generation_task_id != self.task_id:
-                    # Если есть карта с такими же параметрами, созданная в рамках другой генерации
+                    # it means that other generation run already created card with such parameters
                     activity = ExistingCardManager(existing_card).handle_existing_card(
                         dates
                     )
@@ -150,7 +148,7 @@ class CardGenerationService:
         prev_record = {}
         records_to_perform_creation = []
         per_no = employee["per_no"]
-        # ля генерации необходимы только основные места работы
+        # Only main employee_group
         employee["historical_records"] = [
             it
             for it in employee["historical_records"]
@@ -160,12 +158,11 @@ class CardGenerationService:
                 OrganizationMethod.hourly.value,
             )
         ]
-        # Сначала в принципе проверим наличие данных по увольнению
+        # Check if employee generally has data about it's work leaving
         fire_data = self.employee_deactivate_manager.find_employee_quit_data(
             employee["historical_records"]
         )
         self.employee_fired[per_no] = fire_data if fire_data else None
-        # Складываем в структуру, чтобы потом не вычислять данные заново
         self._recalculate_hire_dt(employee["historical_records"])
         if (
             self.employee_fired[per_no]
@@ -174,8 +171,7 @@ class CardGenerationService:
             ]["employee_status"]
             == EmployeeStatus.fired.value
         ):
-            # Есть данные по увольнениям, и последняя запись по табельному номеру есть увольнение, то
-            # мы занимаемся только деактивацией
+            # if employee was fired and the last record is only about it, so we need to only deactivate current cards
             self.employee_deactivate_manager.check_cards_for_deactivation(
                 per_no, self.employee_fired[per_no]
             )
@@ -183,12 +179,11 @@ class CardGenerationService:
 
         if self.employee_fired[
             per_no
-        ]:  # Если данные по увольнениям есть, но последняя запись по данному табельному
-            # не увольнение, то карты до увольнения необходимо проверить на деактивацию
+        ]:  
+            # if it was fired, but now works - let's check all the cards before fire
             fired_record_index, fired_record = self.get_last_fired_record(
                 employee["historical_records"]
             )
-            # Отправляем карты до записи увольнения на проверку, нужно ли их деактивировать
             old_cards_ids = (
                 Card.objects.filter(period=self.period, perno=per_no)
                 .exclude(
@@ -199,25 +194,21 @@ class CardGenerationService:
             self.employee_deactivate_manager.check_cards_for_deactivation(
                 per_no, self.employee_fired[per_no], set(old_cards_ids)
             )
-            # Оставляем только данные после увольнения для работы с новыми картами
+            # only fresh records now make interest
             employee["historical_records"] = employee["historical_records"][
                 fired_record_index + 1 :
             ]
         for record in employee["historical_records"]:
             business_to_dttm = self._dttm_from_str_to_date(record["business_to_dttm"])
             if business_to_dttm < self.period.date_start or record["per_no"] != per_no:
-                # Записи приходят от старых к новым,
-                # поэтому пропускаем все записи, которые закрыты раньше даты начала периода, а также те,
-                # что относятся к другому табельному номеру
+                # Its' agreement that records are coming from old to new one
                 continue
             if (
                 self._dttm_from_str_to_date(record["business_from_dttm"])
                 > self.period.date_end
-            ):  # Текущая проверяемая запись уже вышла за период для которого генерируем карты
+            ):  
                 break
             if not prev_record:
-                # Специально пропускаем первую запись, т.к. решение принимается на основании предыдущей,
-                # если предыдущей нет, то и принимать нечего
                 prev_record = record
                 records_to_perform_creation.append(record)
                 continue
@@ -225,18 +216,17 @@ class CardGenerationService:
                 prev_record["division"]["unit"]
                 == record["division"][
                     "unit"
-                ]  # Предыдущее место в истории равно текущему проверяемому (место работы не поменялось)
+                ]  
                 and prev_record["position"]["staff_position_id"]
                 == record["position"][
                     "staff_position_id"
-                ]  # Должность в предыдущей записи не изменилась
+                ]  
             ) or (
                 record["change_reason_type"]
                 and int(record["change_reason_type"])
                 == ChangeReasonType.technical.value
                 and prev_record["per_no"] == record["per_no"]
             ):
-                # Ключевые атрибуты не поменялись, или перевод технический - идем к следующей записи
                 prev_record = record
                 records_to_perform_creation.append(record)
                 continue
@@ -246,24 +236,22 @@ class CardGenerationService:
                 except Exception as e:
 
                     logger.error(
-                        f"Ошибка при автогенерации карты таб. {per_no}: {type(e), e.with_traceback(None)}"
+                        f"Autogeneration erorr. Details: {per_no}: {type(e), e.with_traceback(None)}"
                     )
                     self.results[CardActivity.errors.value] += 1
 
             prev_record = record
             records_to_perform_creation = [record]
-        # Проверить последнюю пачку записей
         try:
             if records_to_perform_creation:
                 self._intent_to_create_card(records_to_perform_creation)
 
         except Exception as e:
             logger.error(
-                f"Ошибка при автогенерации карты таб. {per_no}: {type(e), e.with_traceback(None)}"
+                f"Autogeneration error. Details: {per_no}: {type(e), e.with_traceback(None)}"
             )
             self.results[CardActivity.errors.value] += 1
 
-        # Когда цикл генерации по сотруднику закончился - необходимо деактивировать его карты, которые не были затронуты
         self.employee_deactivate_manager.check_cards_for_deactivation(
             per_no, self.employee_fired[per_no], self.employee_cards[per_no]
         )
